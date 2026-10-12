@@ -1,0 +1,266 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * S5L8740 NAND controller (FMSS/FIL) — raw PPN page I/O for the Whimory / CS-map stack.
+ *
+ * Terminology (FTL map):
+ * fmss_lba — logical LBA from 16-byte CS metadata
+ * disk_lba — exported FAT volume LBA (Linux/VFAT)
+ * fat_base_lba — fmss_lba of the FAT32 BPB (disk_lba 0)
+ * physical record — ce/cau/block/page/slot/weave/type/lba
+ * CS page — 4×4096 data + 4×16 meta (rec=4112)
+ *
+ * disk_lba 0 → fat_base_lba (proven candidate 49279).
+ * target_fmss_lba = fat_base_lba + disk_lba
+ *
+ * nand-s5l8740.ko owns the controller. ftl-s5l8740.ko owns map / block.
+ */
+#ifndef NAND_S5L8740_H
+#define NAND_S5L8740_H
+
+#include <linux/device.h>
+#include <linux/types.h>
+
+#define NAND_FTL_SECTOR_SIZE		4096U
+#define NAND_FTL_SECTORS_PER_LPN	4U
+#define NAND_FTL_DEFAULT_CAPACITY	3856968U
+
+#define S5L8740_NAND_MAX_CE		2U
+#define S5L8740_NAND_MAX_CAU		2U
+#define S5L8740_NAND_PAGE_SIZE		16384U
+#define S5L8740_NAND_META_SIZE		64U	/* 4 × 16-byte SFTL slots */
+
+/*
+ * Batched meta scan (see s5l8740_nand_cs_read_meta_batch).
+ *
+ * A batch transfers one sector per page, so it yields slot 0 meta only --
+ * 16 bytes, not the 64-byte four-slot record a full-page read returns. That
+ * is what a classify scan reads, and asking for less is what makes the
+ * batch fit: 16 pages of meta land in the 256-byte spare buffer the
+ * sequencer already had.
+ */
+#define S5L8740_NAND_BATCH_META_SIZE	16U
+#define S5L8740_NAND_BATCH_DATA_HEAD	64U
+/*
+ * 128 pages, which is the largest command the sequencer is ever handed.
+ *
+ * The cap is enforced where a page is appended to the command list, at
+ * 0x085172A0:
+ *
+ *	85172cc  ldrh   r0,[r4,#8]      cmd->num_pages
+ *	85172ce  cmp    r0,#0x80
+ *	85172d2  bhs    0x85172ec       return 0, command is full
+ *	85172dc  ldrh.w lr,[r7,#0x10]   per-CE page count
+ *	85172e0  cmp.w  lr,#0x80        and the same ceiling per CE
+ *	85172e4  bhs    0x85172ec
+ *
+ * and every allocation FMSS_PPN Init makes for that command agrees:
+ *
+ *	80ffeec  movw  r0,#0x1010       descriptor list, 4112 bytes
+ *	80ffef8  mov.w r5,#0x200        status array, 512 bytes
+ *
+ * 4112 is 16 * 257 -- two 16-byte descriptors per page plus the terminator --
+ * and 512 is four status bytes per page, so both are 128 pages. The VFL
+ * flushes its read queue at the same number:
+ *
+ *	84f0bde  cmp   r0,#0x80         queued spans
+ *	84f0be0  blo   0x84f0bee
+ *	84f0be4  bl    0x84f0934        _ppnvflReadSpans, then queued = 0
+ *
+ * Callers size their own work from this, so lowering it lowers the scan's
+ * pages-per-kick with it.
+ */
+#define S5L8740_NAND_BATCH_MAX		128U
+
+/*
+ * Read-path batch: whole pages, so the cap is lower than the meta scan's --
+ * 8 * 16 KiB is the 128 KiB the shared DMA buffer holds, and it happens to
+ * be exactly one 128 KiB readahead window (8 pages * 4 LBAs).
+ */
+#define S5L8740_NAND_PAGE_BATCH_MAX	8U
+#define S5L8740_NAND_SLOTS_PER_PAGE	4U
+#define S5L8740_NAND_SLOT_DATA		4096U
+#define S5L8740_NAND_SLOT_META		16U
+#define S5L8740_NAND_REC_BYTES		4112U	/* 4096 data + 16 meta */
+
+/* FTL map names (aliases of the above). */
+#define N31_DATA_SLOTS			S5L8740_NAND_SLOTS_PER_PAGE
+#define N31_DATA_SLOT_SIZE		S5L8740_NAND_SLOT_DATA
+#define N31_META_SLOT_SIZE		S5L8740_NAND_SLOT_META
+#define N31_CS_REC_SIZE			S5L8740_NAND_REC_BYTES
+
+/* PPN DATA spare (CS META stream): glass-proven with rec=4112. */
+#define S5L8740_NAND_META_TYPE_DATA	0x01u
+#define S5L8740_NAND_META_TYPE_DATA2	0x02u
+
+struct s5l8740_nand_geom {
+	u32 num_ce;
+	u32 num_cau;
+	u32 blocks_per_cau;
+	u32 pages_per_block;
+	u32 pages_per_block_slc;
+	u32 page_size;
+	u32 vfl_tail;
+	u32 page_bits;
+	u32 block_bits;
+	u32 cau_bits;
+	u32 caus_per_channel;
+	u32 dev_id;	/* FIL selector 101 analogue */
+	u32 geom_104;	/* FIL selector 104 analogue */
+	u32 geom_105;	/* FIL selector 105 analogue */
+	u32 geom_135;	/* FIL selector 135 analogue */
+	/*
+	 * The rest of the PPN parameter page, at the offsets _FillDevInfo
+	 * (0x0812ED9C) prints them from. That function takes the raw 512-byte
+	 * page as a1 and forms v2 = a1 + 140, so every field below is
+	 * (v2 + k) rewritten as an absolute offset:
+	 *
+	 *	v2 + 84  = 224	params->read_queue_size
+	 *	v2 + 88  = 228	params->program_queue_size
+	 *	v2 + 92  = 232	params->erase_queue_size
+	 *	v2 + 96  = 236	params->prep_function_buffer_size
+	 *	v2 + 112 = 252	params->tCERDY_us
+	 *	v2 + 20  = 160	params->tRC, then tREA, tREH, tRHOH, tRHZ,
+	 *			tRLOH, tRP at 166, and tWC/tWH/tWP at 168-170
+	 *
+	 * read_queue_size is the one with teeth: _performPPNRead
+	 * (0x084EDDDC) stores it at 0x08D10304 and uses it as the per-CE
+	 * prefetch depth, which is the whole reason a stock read pipelines
+	 * and ours does not.
+	 */
+	u32 read_queue_size;
+	u32 program_queue_size;
+	u32 erase_queue_size;
+	u32 prep_function_buffer_size;
+	u32 tcerdy_us;
+	u8 t_rc, t_rea, t_reh, t_rhoh, t_rhz, t_rloh, t_rp;
+	u8 t_wc, t_wh, t_wp;
+	bool from_param_page;
+};
+
+/* Decoded 16-byte CS metadata slot (fmss_lba lives in.lba). */
+struct s5l8740_meta_decoded {
+	u8 type;
+	u8 flags;
+	u64 weave;	/* weaveSeq from meta bytes; width-limited */
+	u32 lba;	/* fmss_lba — NOT disk_lba */
+	bool valid;
+	bool blank;
+};
+
+/* One CS physical page: four data + four meta records (rec=4112). */
+struct s5l8740_cs_page {
+	u8 data[N31_DATA_SLOTS][N31_DATA_SLOT_SIZE];
+	u8 meta_raw[N31_DATA_SLOTS][N31_META_SLOT_SIZE];
+	struct s5l8740_meta_decoded meta[N31_DATA_SLOTS];
+};
+
+/* Legacy alias used by older call sites / Whimory. */
+struct s5l8740_nand_slot_meta {
+	u8 type;
+	u8 flags;
+	u64 weave48;
+	u32 lba;
+	u8 aux[4];
+	bool data_like;
+};
+
+bool nand_ftl_present(void);
+struct device *nand_ftl_device(void);
+unsigned int nand_ftl_lpn_count(void);
+int nand_ftl_build_map(unsigned int max_lpn);
+int nand_ftl_read_sector(u64 logical_sector, void *buf);
+
+u32 s5l8740_nand_fil_get_info(u32 selector);
+int s5l8740_nand_available(void);
+int s5l8740_nand_meta_transport_ok(void);
+int s5l8740_nand_hw_init(void);
+int s5l8740_nand_query_geometry(struct s5l8740_nand_geom *g);
+
+/*
+ * CS physical read (FTL map ABI):
+ * always slot=0, span=4, rec=4112, command-list CS DMA
+ * fills 4 data + 4 meta slots; no lba_map ingest
+ * Requires dma_dry=0 and dma_armed=1 (one-shot friendly).
+ */
+int s5l8740_nand_cs_read_meta_batch(u8 ce, u8 cau, const u16 *blocks, u8 page,
+				    unsigned int n, u8 *meta_out, u8 *data_out,
+				    unsigned int data_bytes);
+/*
+ * One physical page, named. A batch is a list of these on a single CE --
+ * cau, block and page all vary per entry, because the FTL stripes
+ * consecutive LBAs across every (ce, cau) before it advances the page, so
+ * the pages a sequential read wants next are never consecutive on one chip.
+ */
+struct s5l8740_ppn_ref {
+	u16 block;
+	u8 cau;
+	u8 page;
+};
+
+int s5l8740_nand_cs_read_pages_batch(u8 ce, const struct s5l8740_ppn_ref *refs,
+				     unsigned int n, u8 *data_out,
+				     u8 *meta_out);
+
+/*
+ * Meta-only scan: n arbitrary pages on one CE, one kick, 16 bytes of spare
+ * per page and no page data at all. This is stock's mount scan shape
+ * (s_cxt_diff.c:349) -- every read lands its data in the same discarded
+ * buffer while only the meta cursor advances, so 256 pages cost one kick
+ * and 4 KiB of meta.
+ */
+int s5l8740_nand_cs_scan_meta(u8 ce, const struct s5l8740_ppn_ref *refs,
+			      unsigned int n, u8 *meta_out);
+int s5l8740_nand_cs_phys_read_slot0(u8 ce, u8 cau, u16 block, u8 page,
+				    struct s5l8740_cs_page *out);
+int s5l8740_nand_cs_phys_read_span(u8 ce, u8 cau, u16 block, u8 page,
+				   struct s5l8740_cs_page *out, unsigned int span);
+int s5l8740_nand_cs_phys_read_slc(u8 ce, u8 cau, u16 block, u8 page, u8 slc,
+				  struct s5l8740_cs_page *out, unsigned int span);
+int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
+			      struct s5l8740_cs_page *out);
+
+/*
+ * Hold dma_armed across a multi-page CS scan; restores prior dry/one_shot
+ * when the last nested session closes. begin() always returns 0 and nests,
+ * so every begin must be paired with exactly one end.
+ */
+int s5l8740_nand_dma_session_begin(void);
+void s5l8740_nand_dma_session_end(void);
+unsigned int s5l8740_nand_dma_session_depth(void);
+
+void s5l8740_nand_meta_decode(const u8 *m16,
+			      struct s5l8740_meta_decoded *out);
+
+/* Legacy decode into slot_meta (aux + data_like). */
+void s5l8740_nand_meta_decode_legacy(const u8 *m16,
+				     struct s5l8740_nand_slot_meta *out);
+
+static inline bool n31_meta_is_data_record(const struct s5l8740_meta_decoded *m)
+{
+	if (!m || !m->valid || m->blank)
+		return false;
+	return m->type == S5L8740_NAND_META_TYPE_DATA ||
+	       m->type == S5L8740_NAND_META_TYPE_DATA2;
+}
+
+static inline bool n31_weave_newer(u64 a, u64 b)
+{
+	return a > b;
+}
+
+/*
+ * Among four decoded meta records, pick newest weave claiming @fmss_lba
+ * with type in {0x01,0x02}. Returns slot 0..3 or -ENOENT.
+ */
+int s5l8740_nand_meta_pick_lba(const struct s5l8740_cs_page *page,
+			       u32 fmss_lba);
+
+int s5l8740_nand_page_read(unsigned int ce, unsigned int cau,
+			   unsigned int block, unsigned int page,
+			   unsigned int slc, unsigned int chunks,
+			   void *data, size_t data_len,
+			   void *meta, size_t meta_len);
+int s5l8740_nand_reset(void);
+void s5l8740_nand_register_ftl_read(int (*fn)(u64 lba, void *buf));
+
+#endif /* NAND_S5L8740_H */

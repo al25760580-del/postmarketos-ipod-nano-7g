@@ -1,0 +1,53 @@
+/dts-v1/;
+
+/ {
+    description = "Linux 6.14 + Alpine Linux 3.21.8 + Rhythmbox + Apple Grape Touch + Audio for iPod Nano 7G (N31)";
+    #address-cells = <1>;
+
+    images {
+        kernel {
+            description = "Linux kernel 6.14-n31";
+            data = /incbin/("/var/tmp/build-touch/zImage-n31");
+            type = "kernel";
+            arch = "arm";
+            os = "linux";
+            compression = "none";
+            load = <0x08008000>;
+            entry = <0x08008000>;
+            hash-1 {
+                algo = "crc32";
+            };
+        };
+        fdt-1 {
+            description = "Flattened Device Tree blob (N31)";
+            data = /incbin/("/var/tmp/build-touch/s5l8740-n31.dtb");
+            type = "flat_dt";
+            arch = "arm";
+            compression = "none";
+            hash-1 {
+                algo = "crc32";
+            };
+        };
+        ramdisk-1 {
+            description = "Alpine Linux 3.21.8 armhf + Rhythmbox UI + Apple Grape Touch + MP3 Audio";
+            data = /incbin/("/var/tmp/build-touch/initramfs-n31.cpio.gz");
+            type = "ramdisk";
+            arch = "arm";
+            os = "linux";
+            compression = "gzip";
+            hash-1 {
+                algo = "crc32";
+            };
+        };
+    };
+
+    configurations {
+        default = "conf-1";
+        conf-1 {
+            description = "Boot Linux kernel with FDT and Alpine initramfs";
+            kernel = "kernel";
+            fdt = "fdt-1";
+            ramdisk = "ramdisk-1";
+        };
+    };
+};
