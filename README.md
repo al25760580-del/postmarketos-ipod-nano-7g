@@ -1,8 +1,7 @@
 - [x] Boot (yepyep!)
 
 - [x] Touch
-  - Takes a lot of time to work for some reason, but it does!
-  - Sometimes it takes hours (?)
+  - it shows da touchie log every click
 
 - [x] Xorg
   - Kinda! Xorg uses a framebuffer bridge thingy, but it works!
@@ -17,3 +16,5 @@
 
 - [x] USB0
   - Connects, but SSH doesn't work because da script is buggy.
+
+![AN epic image of two rats fighting for a churro](https://github.com/al25760580-del/postmarketos-ipod-nano-7g/blob/main/captura_ipod.png?raw=true)
