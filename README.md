@@ -1,12 +1,19 @@
-[X] Boot Yepyep
-[X] Touch
-Takes a lot of time to work for some reason but it does!
-sometimes hours(?
-[X] XORG
-Kinda, xorg uses a framebuffer bridge thingy but works!
-[] GPU accel
-not really! check da kernel
-https://github.com/andrew867/linux-s5l87xx/tree/n31/glass-peripherals
-[X] Audio
-[X] Display 
-[X] USB0 connects but nope ssh cuz de script is buggy
+- [x] Boot (yepyep!)
+
+- [x] Touch
+  - Takes a lot of time to work for some reason, but it does!
+  - Sometimes it takes hours (?)
+
+- [x] Xorg
+  - Kinda! Xorg uses a framebuffer bridge thingy, but it works!
+
+- [ ] GPU acceleration
+  - Not really! Check da kernel:
+    https://github.com/andrew867/linux-s5l87xx/tree/n31/glass-peripherals
+
+- [x] Audio
+
+- [x] Display
+
+- [x] USB0
+  - Connects, but SSH doesn't work because da script is buggy.
